@@ -174,6 +174,20 @@ class Krea2Pipeline:
         self.transformer = m
         self.vae = _load_vae(base)
         self.encoder = Qwen3VLConditioner(base, dtype=mx.bfloat16)
+        self._lora_sig: tuple = ()   # currently-applied (path, scale) set, to skip redundant rebuilds
+        self._lora_paths: list = []  # wrapped target paths, for clean unload
+
+    def set_loras(self, specs) -> None:
+        """Apply a set of LoRAs (list of (path, scale)) to the transformer, replacing any
+        previously-applied set. Empty/None clears all LoRAs. Cheap no-op if unchanged."""
+        specs = [(str(p), float(s)) for p, s in (specs or [])]
+        sig = tuple(specs)
+        if sig == self._lora_sig:
+            return
+        from .lora import apply_loras, unload_loras
+        unload_loras(self.transformer, self._lora_paths)
+        self._lora_paths = apply_loras(self.transformer, specs) if specs else []
+        self._lora_sig = sig
 
     def generate(self, prompt, *, width=1024, height=1024, steps=8, seed=0, num_images=1,
                  init_image=None, strength=0.6, step_callback=None):
