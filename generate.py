@@ -30,6 +30,10 @@ def main():
                     help="img2img: path to an input image to transform (scaled to --width/--height)")
     ap.add_argument("--strength", type=float, default=0.6,
                     help="img2img: how much to change the input, (0, 1] — higher = more change (default 0.6)")
+    ap.add_argument("--lora", action="append", default=None, metavar="LORA[:SCALE]",
+                    help="apply a Krea-2 LoRA: a local .safetensors path or a HF repo id "
+                         "(e.g. from huggingface.co/collections/krea/krea-2-loras), with an "
+                         "optional :SCALE suffix (default 1.0). Repeatable — LoRAs stack.")
     ap.add_argument("--out", default="out.png")
     ap.add_argument("--no-safety", action="store_true",
                     help="disable the NSFW content filter (on by default; see the license)")
@@ -49,7 +53,20 @@ def main():
         # local file if present, else download the chosen build (8bit / mixed-4-8; default 8bit)
         precision, tpath = resolve_weights(here, precision=precision, download=True)
 
+    loras = []
+    for spec in args.lora or []:  # LORA[:SCALE] — the tail is a scale only if it parses as a number
+        path, _, tail = spec.rpartition(":")
+        try:
+            loras.append((path, float(tail)) if path else (spec, 1.0))
+        except ValueError:
+            loras.append((spec, 1.0))
+
     pipe = Krea2Pipeline(transformer_path=tpath, precision=precision)
+    if loras:
+        try:
+            pipe.set_loras(loras)
+        except (ValueError, FileNotFoundError, OSError) as e:
+            ap.error(f"--lora: {e}")
     try:
         images = pipe.generate(args.prompt, width=args.width, height=args.height,
                                steps=args.steps, seed=args.seed, num_images=args.num_images,

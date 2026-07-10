@@ -70,6 +70,22 @@ the entry points come from the step schedule, granularity is limited at low step
 `--steps 8` the lowest effective strength is ~0.2–0.3 (values below it round up), and img2img
 needs `--steps` ≥ 2.
 
+**LoRA** — style the output with any [Krea-2 LoRA](https://huggingface.co/collections/krea/krea-2-loras)
+(or your own, trained with PEFT/diffusers against the reference model):
+
+```bash
+python3 generate.py "a red fox in the snow" --lora krea/some-krea-2-lora        # HF repo id
+python3 generate.py "a red fox in the snow" --lora my_lora.safetensors:0.8      # local file @ 0.8
+python3 generate.py "…" --lora style_a.safetensors --lora style_b.safetensors:0.5   # stack
+```
+
+`--lora` takes a local `.safetensors` file or a Hugging Face repo id, with an optional `:SCALE`
+suffix (default 1.0), and is repeatable — multiple LoRAs stack. In the web UI, open the
+**LoRA (optional)** panel and paste a path or repo id, plus a strength slider. LoRAs are applied
+as a runtime low-rank branch on top of the loaded weights, so they work on **all builds** —
+8-bit, mixed-4/8, and bf16 — with no dequantize/merge cycle; scale 0 (or clearing the field)
+is byte-identical to the base model. From Python: `pipe.set_loras([(path_or_repo, scale), …])`.
+
 > **Choose your build:** in the web UI, pick **8-bit** or **mixed-4/8** from the **Model**
 > dropdown — it downloads the chosen one on first use. On the CLI, add `--precision mixed-4-8`
 > (or `8bit`). Default is 8-bit.
@@ -127,6 +143,8 @@ Reproduce it yourself: see [`validation/`](validation/).
 - **Text encoder** Qwen3-VL-4B (text-only), pure MLX.
 - **VAE** Qwen-Image VAE — reused from [mflux](https://github.com/filipstrand/mflux).
 - **Sampler** flow-matching Euler, 8-step Turbo (no CFG).
+- **LoRA** runtime adapters (`krea2/lora.py`) — PEFT/diffusers key formats, stackable,
+  reversible, quantization-friendly (the low-rank branch wraps the quantized layer).
 - **Safety** NSFW content filter (Falconsai/nsfw_image_detection) — on by default; redacts
   flagged outputs (see *Safety* below).
 

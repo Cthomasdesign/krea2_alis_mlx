@@ -42,12 +42,29 @@ def _pipe(precision):
     return _PIPE
 
 
-def generate(prompt, model, size, steps, seed, num_images, safety_on, progress=gr.Progress()):
+def _ensure_lora(pipe, lora, scale):
+    """Apply/clear the LoRA on `pipe` only when the (path, scale) spec changed.
+    The spec is remembered on the pipeline object, so a rebuilt pipeline
+    (model switch) naturally re-applies it."""
+    spec = (lora.strip(), round(float(scale), 4)) if lora and lora.strip() else None
+    if getattr(pipe, "_lora_spec", "unset") == spec:
+        return
+    try:
+        pipe.set_loras([spec] if spec else [])
+    except (ValueError, FileNotFoundError, OSError) as e:
+        pipe._lora_spec = None  # set_loras restored the base model
+        raise gr.Error(f"LoRA: {e}") from None
+    pipe._lora_spec = spec
+
+
+def generate(prompt, model, size, steps, seed, num_images, lora, lora_scale, safety_on,
+             progress=gr.Progress()):
     if not prompt or not prompt.strip():
         raise gr.Error("Enter a prompt.")
     try:
         progress(0, desc="Loading model… (first run downloads weights — a few minutes)")
         pipe = _pipe(model)
+        _ensure_lora(pipe, lora, lora_scale)
         s = int(size)
 
         def cb(step, total):
@@ -86,6 +103,11 @@ with gr.Blocks(title="Krea 2 Turbo · Alis MLX", theme=gr.themes.Soft()) as demo
             with gr.Row():
                 seed = gr.Number(value=0, label="Seed", precision=0)
                 num_images = gr.Slider(1, 4, value=1, step=1, label="Images")
+            with gr.Accordion("LoRA (optional)", open=False):
+                lora = gr.Textbox(label="LoRA — local .safetensors path or HF repo id",
+                                  placeholder="e.g. krea/… from the Krea-2 LoRA collection",
+                                  value="")
+                lora_scale = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="LoRA strength")
             safety_chk = gr.Checkbox(value=True, label="NSFW safety filter (recommended; required by the license for public deployments)")
             btn = gr.Button("Generate", variant="primary")
             gr.Examples(
@@ -96,7 +118,7 @@ with gr.Blocks(title="Krea 2 Turbo · Alis MLX", theme=gr.themes.Soft()) as demo
             )
         with gr.Column(scale=1):
             gallery = gr.Gallery(label="Output", columns=2, height=560, object_fit="contain")
-    btn.click(generate, [prompt, model, size, steps, seed, num_images, safety_chk], gallery)
+    btn.click(generate, [prompt, model, size, steps, seed, num_images, lora, lora_scale, safety_chk], gallery)
 
 
 if __name__ == "__main__":

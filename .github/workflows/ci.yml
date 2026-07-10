@@ -36,3 +36,5 @@ jobs:
         run: python -c "import krea2; print('krea2 exports:', krea2.__all__)"
       - name: Input-validation test (no weights, no download)
         run: python validation/test_input_validation.py
+      - name: LoRA parity test (no weights, no download)
+        run: python validation/test_lora.py

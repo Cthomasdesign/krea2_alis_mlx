@@ -109,6 +109,30 @@ def resolve_weights(folder: str = ".", precision: str | None = None, download: b
     return _resolve("8bit")
 
 
+def resolve_lora(name: str) -> str:
+    """Resolve a LoRA spec to a local .safetensors path.
+
+    Accepts a local file path, or a Hugging Face repo id like
+    'krea/krea-2-lora-…' — the repo's root-level LoRA .safetensors is then
+    downloaded and cached under ~/.cache/krea2_alis_mlx.
+    """
+    import re
+
+    if os.path.exists(name):
+        return name
+    if re.fullmatch(r"[\w.\-]+/[\w.\-]+", name):
+        from huggingface_hub import HfApi
+
+        files = [s.rfilename for s in HfApi().model_info(name).siblings
+                 if s.rfilename.endswith(".safetensors") and "/" not in s.rfilename]
+        if not files:
+            raise FileNotFoundError(f"LoRA repo {name} has no root-level .safetensors file.")
+        # prefer an explicitly lora-named file if the repo ships several
+        fname = sorted(files, key=lambda f: ("lora" not in f.lower(), f))[0]
+        return _http_download(name, fname, os.path.join(_CACHE, name.replace("/", "__")))
+    raise FileNotFoundError(f"LoRA not found: {name!r} is neither a local file nor a HF repo id.")
+
+
 def _base_dir() -> str:
     """Fetch the VAE / Qwen3-VL-4B encoder / tokenizer from krea/Krea-2-Turbo over HTTP."""
     from huggingface_hub import HfApi
@@ -174,6 +198,26 @@ class Krea2Pipeline:
         self.transformer = m
         self.vae = _load_vae(base)
         self.encoder = Qwen3VLConditioner(base, dtype=mx.bfloat16)
+        self.loras: list[tuple[str, float]] = []
+
+    def set_loras(self, loras):
+        """Replace the active LoRA set on the transformer (works on all precisions).
+
+        `loras`: iterable of `path` or `(path, scale)` — a local .safetensors
+        file or a HF repo id (see `resolve_lora`); pass `[]`/`None` to restore
+        the base model exactly. Adapters stack when several are given.
+        """
+        from .lora import set_loras as _set_loras
+
+        resolved = []
+        for item in loras or []:
+            path, scale = item if isinstance(item, (tuple, list)) else (item, 1.0)
+            resolved.append((resolve_lora(str(path)), scale))
+        try:
+            self.loras = _set_loras(self.transformer, resolved)
+        except Exception:
+            self.loras = []  # set_loras restores the base model on failure
+            raise
 
     def generate(self, prompt, *, width=1024, height=1024, steps=8, seed=0, num_images=1,
                  init_image=None, strength=0.6, step_callback=None):
