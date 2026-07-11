@@ -97,6 +97,40 @@ you pick:
 
 ---
 
+## 🎨 LoRAs
+
+Krea-2 LoRAs work directly on these quantized builds. Per Krea's guidance — *train on Raw, run on
+Turbo* — a Raw-trained LoRA expresses on the Turbo weights here. Point the CLI or the Python API
+at any local `.safetensors` LoRA. Both LoRA naming conventions are supported: the **official Krea /
+diffusers** format (e.g. [`krea/Krea-2-LoRA-darkbrush`](https://huggingface.co/krea/Krea-2-LoRA-darkbrush),
+`transformer_blocks.N.attn.to_q`) and the **ai-toolkit / PEFT** format from self-training
+(`base_model.model.blocks.N.attn.wq`).
+
+**CLI:**
+```bash
+python3 generate.py "a red fox in the snow" \
+  --lora-paths loras/krea2_realism_lora.safetensors --lora-scales 0.9 --out fox.png
+# stack several: --lora-paths a.safetensors b.safetensors --lora-scales 0.8 0.5
+```
+
+**Python:**
+```python
+pipe.set_loras([("loras/krea2_realism_lora.safetensors", 0.9)])  # replaces the active set
+img = pipe.generate("a red fox in the snow", seed=42)[0]
+pipe.set_loras([])                                               # clear → exact base
+```
+
+**How it works** ([`krea2/lora.py`](krea2/lora.py)): each adapter is added as a *runtime low-rank
+branch* — `y = base(x) + Σ scaleᵢ·(x·Aᵢᵀ)·Bᵢᵀ` — rather than merged into the weights. Because it
+only calls `base(x)`, it runs **on the quantized transformer** (no dequant/merge/requant), is
+**stackable**, and is fully **reversible** (clearing restores the exact base). The key-mapper
+strips the LoRA's wrapper prefix and rewrites diffusers layer names to the module tree
+(`transformer_blocks→blocks`, `to_q→wq`, `ff.gate→mlp.gate`, `img_in→first`, …); unmapped keys raise
+rather than silently mis-apply. Sanity check:
+[`validation/validate_lora.py`](validation/validate_lora.py) (scale-0 == base; 0 unmatched keys).
+
+---
+
 ## ✅ Verified faithful to PyTorch
 
 Every stage was cross-checked against the [original PyTorch code](https://github.com/krea-ai/krea-2)
