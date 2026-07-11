@@ -30,6 +30,10 @@ def main():
                     help="img2img: path to an input image to transform (scaled to --width/--height)")
     ap.add_argument("--strength", type=float, default=0.6,
                     help="img2img: how much to change the input, (0, 1] — higher = more change (default 0.6)")
+    ap.add_argument("--lora-paths", nargs="*", default=[],
+                    help="one or more LoRA .safetensors to apply (stackable)")
+    ap.add_argument("--lora-scales", nargs="*", type=float, default=None,
+                    help="strength per LoRA (default 1.0; a single value applies to all)")
     ap.add_argument("--out", default="out.png")
     ap.add_argument("--no-safety", action="store_true",
                     help="disable the NSFW content filter (on by default; see the license)")
@@ -43,6 +47,18 @@ def main():
         except (OSError, UnidentifiedImageError, ValueError) as e:
             ap.error(f"--init-image: cannot read {args.init_image!r}: {e}")
 
+    lora_specs = []
+    if args.lora_paths:  # likewise, catch bad LoRA args before the big load
+        scales = args.lora_scales if args.lora_scales is not None else [1.0]
+        if len(scales) == 1:
+            scales = scales * len(args.lora_paths)
+        if len(scales) != len(args.lora_paths):
+            ap.error("--lora-scales must give one value, or one per --lora-paths")
+        for p in args.lora_paths:
+            if not os.path.isfile(p):
+                ap.error(f"--lora-paths: no such file: {p!r}")
+        lora_specs = list(zip(args.lora_paths, scales))
+
     here = os.path.dirname(os.path.abspath(__file__))
     precision, tpath = args.precision, args.transformer
     if precision != "bf16" and tpath is None:
@@ -50,6 +66,11 @@ def main():
         precision, tpath = resolve_weights(here, precision=precision, download=True)
 
     pipe = Krea2Pipeline(transformer_path=tpath, precision=precision)
+    if lora_specs:
+        try:
+            pipe.set_loras(lora_specs)
+        except (ValueError, FileNotFoundError) as e:
+            ap.error(str(e))  # e.g. an unmapped key or a non-LoRA safetensors
     try:
         images = pipe.generate(args.prompt, width=args.width, height=args.height,
                                steps=args.steps, seed=args.seed, num_images=args.num_images,
