@@ -18,8 +18,10 @@ Key mapping (`_to_mlx_path`): the mapper strips a wrapper prefix (`base_model.mo
 the official Krea / diffusers names (`transformer_blocks.N.attn.to_q`, `img_in`, `final_layer`,
 `ff.gate`, as in `krea/Krea-2-LoRA-*`) and the ai-toolkit / PEFT names that already match
 (`blocks.N.attn.wq`, `mlp.down`, `first`, `last.linear`, `txtfusion...`). `A` is (rank, in),
-`B` is (out, rank). Effective scale folds in alpha/rank from the file metadata
-(`lora_alpha`/`lora_rank`), matching diffusers/PEFT conventions. Unmapped keys raise.
+`B` is (out, rank). Effective scale folds in alpha/rank — a per-layer `.alpha` tensor when the
+file carries one, else the file metadata (`lora_alpha`/`lora_rank`) — matching diffusers/PEFT
+conventions. Unmapped keys, unpaired/colliding tensors, and shapes that don't fit the target
+layer all raise before the model is touched (`apply_loras` validates fully, then mutates).
 """
 
 from __future__ import annotations
@@ -30,8 +32,8 @@ import struct
 import mlx.core as mx
 from mlx import nn
 
-# LoRA wrapper prefixes (PEFT / ComfyUI / kohya) stripped before mapping to the module tree.
-_PREFIXES = ("base_model.model.", "transformer.", "diffusion_model.", "lora_unet_")
+# LoRA wrapper prefixes (PEFT / diffusers / ComfyUI) stripped before mapping to the module tree.
+_PREFIXES = ("base_model.model.", "transformer.", "diffusion_model.")
 
 # Krea-2 LoRAs ship in two naming conventions: the reference / ai-toolkit names that already match
 # this port's module tree (e.g. `blocks.N.attn.wq`), and the official Krea / diffusers names
@@ -129,35 +131,49 @@ def _read_metadata(path: str) -> dict:
     return header.get("__metadata__", {}) or {}
 
 
-def _normalize(weights: dict) -> dict:
+def _normalize(weights: dict) -> tuple[dict, dict]:
     """Pair lora_A/lora_B tensors by target module path.
 
-    Returns {target_path: (A, B)}. Accepts the PEFT `lora_A`/`lora_B` and the kohya
-    `lora_down`/`lora_up` conventions; raises on anything it can't pair.
+    Returns ({target_path: (A, B)}, {target_path: alpha}). Accepts the PEFT `lora_A`/`lora_B`
+    and the `lora_down`/`lora_up` suffix variants (dot-separated paths only); per-layer `.alpha`
+    tensors are collected for scaling. Raises on anything it can't pair, and on two keys mapping
+    to the same target (a mis-mapping would otherwise be applied silently).
     """
-    out: dict[str, tuple] = {}
-    a_keys = {}
-    b_keys = {}
+    a_keys: dict[str, str] = {}
+    b_keys: dict[str, str] = {}
+    alphas: dict[str, float] = {}
     for k in weights:
         if k.endswith(".alpha"):
-            continue  # per-layer alpha handled via file metadata below
+            alphas[_to_mlx_path(k[: -len(".alpha")])] = float(weights[k].item())
+            continue
         for suf, bucket in ((".lora_A.weight", a_keys), (".lora_down.weight", a_keys),
                             (".lora_B.weight", b_keys), (".lora_up.weight", b_keys)):
             if k.endswith(suf):
-                bucket[_to_mlx_path(k[: -len(suf)])] = k
+                tgt = _to_mlx_path(k[: -len(suf)])
+                if tgt in bucket:
+                    raise ValueError(f"LoRA keys '{bucket[tgt]}' and '{k}' both map to '{tgt}'")
+                bucket[tgt] = k
                 break
         else:
             raise ValueError(f"Unrecognized LoRA key (no lora_A/B/down/up suffix): {k}")
     missing = set(a_keys) ^ set(b_keys)
     if missing:
-        raise ValueError(f"LoRA has unpaired A/B tensors for: {sorted(missing)[:5]} …")
-    for tgt in a_keys:
-        out[tgt] = (weights[a_keys[tgt]], weights[b_keys[tgt]])
-    return out
+        shown = sorted(missing)[:5]
+        raise ValueError(f"LoRA has unpaired A/B tensors for: {shown}"
+                         + (" …" if len(missing) > 5 else ""))
+    return {t: (weights[a_keys[t]], weights[b_keys[t]]) for t in a_keys}, alphas
+
+
+def _linear_dims(layer) -> tuple[int, int]:
+    """(out_features, in_features) of a plain or quantized linear layer."""
+    if isinstance(layer, nn.QuantizedLinear):  # weight is bit-packed; scales is (out, in/group)
+        return layer.scales.shape[0], layer.scales.shape[1] * layer.group_size
+    return layer.weight.shape[0], layer.weight.shape[1]
 
 
 def _alpha_factor(meta: dict) -> float:
-    """Scale multiplier alpha/rank (diffusers/PEFT convention); 1.0 if unspecified."""
+    """File-level scale multiplier alpha/rank (diffusers/PEFT convention); 1.0 if unspecified.
+    Used as the fallback for targets without a per-layer `.alpha` tensor."""
     try:
         alpha = float(meta.get("lora_alpha", meta.get("alpha", 0)))
         rank = float(meta.get("lora_rank", meta.get("r", 0)))
@@ -195,22 +211,28 @@ def unload_loras(model, paths) -> int:
 def apply_loras(model, specs, *, dtype=mx.bfloat16) -> list[str]:
     """Apply LoRAs to `model` in place. `specs` is a list of (path, scale); multiple LoRAs
     targeting the same layer stack. Returns the list of wrapped target paths (pass to
-    `unload_loras` to revert). Raises if a target path can't be resolved, naming it."""
+    `unload_loras` to revert).
+
+    Two-phase: every raise condition — unresolvable target, non-linear target, adapter shapes
+    that don't fit the base layer — is checked *before* the first swap, so a failure leaves
+    the model exactly as it was (no half-applied adapter set)."""
     # gather: target_path -> ([A...], [B...], [scale...])
     grouped: dict[str, tuple[list, list, list]] = {}
     for path, scale in specs:
         weights = mx.load(path)
-        factor = _alpha_factor(_read_metadata(path))
-        adapters = _normalize(weights)
-        eff = float(scale) * factor
+        adapters, alphas = _normalize(weights)
+        fallback = _alpha_factor(_read_metadata(path))
         for tgt, (a, b) in adapters.items():
+            alpha = alphas.get(tgt)
+            factor = (alpha / a.shape[0]) if alpha else fallback  # rank = A.shape[0]
             slot = grouped.setdefault(tgt, ([], [], []))
             slot[0].append(a.astype(dtype))
             slot[1].append(b.astype(dtype))
-            slot[2].append(eff)
+            slot[2].append(float(scale) * factor)
 
-    wrapped = []
-    for tgt, (a_list, b_list, scales) in grouped.items():
+    # phase 1: resolve and validate every target against the model — nothing mutated yet
+    resolved: dict[str, nn.Module] = {}
+    for tgt, (a_list, b_list, _) in grouped.items():
         try:
             base = _get_submodule(model, tgt)
         except (AttributeError, IndexError, KeyError, ValueError) as e:
@@ -219,13 +241,16 @@ def apply_loras(model, specs, *, dtype=mx.bfloat16) -> list[str]:
             base = base.base
         if not isinstance(base, (nn.Linear, nn.QuantizedLinear)):
             raise ValueError(f"LoRA target '{tgt}' is {type(base).__name__}, not a linear layer")
-        # sanity: A is (rank, in_features); fail loudly on an obvious shape mismatch
-        in_feats = a_list[0].shape[1]
-        for a, b in zip(a_list, b_list):
-            if a.shape[1] != in_feats or a.shape[0] != b.shape[1]:
-                raise ValueError(f"LoRA shape mismatch at '{tgt}': A{a.shape} B{b.shape}")
-        _set_submodule(model, tgt, LoRALinear(base, a_list, b_list, scales))
-        wrapped.append(tgt)
+        out_f, in_f = _linear_dims(base)  # catch a LoRA trained for a different model here,
+        for a, b in zip(a_list, b_list):  # not as a matmul error mid-generation
+            if a.shape[1] != in_f or b.shape[0] != out_f or a.shape[0] != b.shape[1]:
+                raise ValueError(f"LoRA shape mismatch at '{tgt}': A{a.shape} B{b.shape} "
+                                 f"vs base ({out_f}, {in_f})")
+        resolved[tgt] = base
+
+    # phase 2: swap the wrappers in — no raise conditions below
+    for tgt, (a_list, b_list, scales) in grouped.items():
+        _set_submodule(model, tgt, LoRALinear(resolved[tgt], a_list, b_list, scales))
 
     mx.eval(model.parameters())
-    return wrapped
+    return list(grouped)

@@ -69,8 +69,8 @@ def main():
     if lora_specs:
         try:
             pipe.set_loras(lora_specs)
-        except (ValueError, FileNotFoundError) as e:
-            ap.error(str(e))  # e.g. an unmapped key or a non-LoRA safetensors
+        except (ValueError, OSError, RuntimeError) as e:
+            ap.error(str(e))  # unmapped key / non-LoRA or corrupt safetensors (mx.load raises RuntimeError)
     try:
         images = pipe.generate(args.prompt, width=args.width, height=args.height,
                                steps=args.steps, seed=args.seed, num_images=args.num_images,

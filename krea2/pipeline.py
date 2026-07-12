@@ -179,14 +179,22 @@ class Krea2Pipeline:
 
     def set_loras(self, specs) -> None:
         """Apply a set of LoRAs (list of (path, scale)) to the transformer, replacing any
-        previously-applied set. Empty/None clears all LoRAs. Cheap no-op if unchanged."""
+        previously-applied set. Empty/None clears all LoRAs. Cheap no-op if unchanged —
+        note the cache keys on (path, scale), so editing a LoRA file in place won't
+        re-apply it; clear first or use a different path.
+
+        Exception-safe: if applying the new set fails (bad file, unmapped key, wrong
+        shapes), the transformer is left at the exact base state and the cache is cleared,
+        so a retry — including with the previously-working set — really re-applies."""
         specs = [(str(p), float(s)) for p, s in (specs or [])]
         sig = tuple(specs)
         if sig == self._lora_sig:
             return
         from .lora import apply_loras, unload_loras
         unload_loras(self.transformer, self._lora_paths)
-        self._lora_paths = apply_loras(self.transformer, specs) if specs else []
+        self._lora_sig, self._lora_paths = (), []  # now at base; commit only on success
+        if specs:
+            self._lora_paths = apply_loras(self.transformer, specs)  # validates, then mutates
         self._lora_sig = sig
 
     def generate(self, prompt, *, width=1024, height=1024, steps=8, seed=0, num_images=1,
