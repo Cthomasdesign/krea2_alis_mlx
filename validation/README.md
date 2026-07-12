@@ -27,6 +27,7 @@ Run from the **repo root** (so `import krea2` and the relative paths resolve), e
 | `validate_vae.py` | MLX VAE decode vs 🤗 diffusers | cos 0.9994 |
 | `validate_e2e.py` | full pipeline, MLX vs PyTorch, identical noise | pixel cos 1.000000 |
 | `validate_quant.py` | per-step velocity cos vs bf16 (8-bit / mixed-4/8 / 4-bit) | see model card |
+| `validate_lora.py` | LoRA runtime branch: key mapping (incl. diffusers fixture), scale-0 parity, two-phase apply, `set_loras` lifecycle | PASS (self-checking; downloads its LoRA from HF, no PT needed) |
 | `eval_mxfp.py` | MXFP4 / MXFP8 vs affine (why MXFP was rejected) | see model card |
 | `test_*.py` | structural / weight-load / VAE-decode smoke tests | — |
 | `build_release*.py` | build the 8-bit / mixed-4/8 HF artifacts | — |
